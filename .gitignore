@@ -1,0 +1,32 @@
+# Cache files
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment
+.env
+*.env
+
+# Output
+output/
+*.png
+*.jpg
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Playwright
+.playwright-mcp/
