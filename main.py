@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-ETF Trading System v2 — Main Entry Point
+ETF Trading System v2.1 — Main Entry Point
 
-Strategy: Trend-Filtered Momentum Rotation
+Strategy: Trend-Filtered Momentum Rotation (optimized with v3 learnings)
 Pool: CSI 1000 constituents + all ETFs (filtered)
 Data: Sina Finance + Baostock
-Targets: Monthly win rate >= 50%, Annual excess >= 5% vs CSI 1000
+Improvements: Look-ahead fixed, 10+1 factors, weekly/monthly rebalancing
 """
 import sys
 import os
@@ -16,7 +16,7 @@ import pandas as pd
 from data_fetcher import (fetch_batch_stocks, fetch_batch_etfs, fetch_csi1000_index,
                           build_price_matrix, build_volume_matrix)
 from universe import build_universe
-from strategy import MomentumRotationStrategy
+from strategy import MomentumRotationStrategy, FACTOR_KEYS
 from backtest import run_backtest
 from evaluation import compute_metrics, check_targets, print_report, plot_results
 from optimizer import optimize
@@ -26,7 +26,7 @@ BACKTEST_START = "2021-01-01"
 BACKTEST_END = "2026-05-01"
 DATA_START = "2020-01-01"
 
-# Best parameters from v2 optimization
+# v2.1 optimized params — baseline + look-ahead fix + parameter tuning
 BEST_PARAMS = {
     "top_n_bull": 25, "top_n_bear": 12,
     "mom_periods": (21, 63, 126, 252),
@@ -34,19 +34,63 @@ BEST_PARAMS = {
     "score_weights_bull": (0.6, 0.3, 0.1),
     "score_weights_bear": (0.35, 0.5, 0.15),
     "stop_loss": -0.12,
+    "bear_cash_ratio": 0.25,
+    "vol_target": 0.15,
+    "trend_ma": 220,
+    "risk_off_threshold": -0.10,
+    "rebalance_freq": "monthly",
+    "extra_factor_weights": {
+        "ma20_slope": 0.02, "ma60_slope": 0.01,
+        "ma_score": 0.01, "vp_corr_20d": 0.02,
+    },
+}
+
+# v2.1 with light extra factor weights (MA slope + MA alignment + VP correlation)
+BEST_PARAMS_EXTRA = {
+    "top_n_bull": 25, "top_n_bear": 12,
+    "mom_periods": (21, 63, 126, 252),
+    "mom_weights": (0.4, 0.3, 0.2, 0.1),
+    "score_weights_bull": (0.55, 0.30, 0.10),
+    "score_weights_bear": (0.33, 0.47, 0.12),
+    "stop_loss": -0.12,
     "bear_cash_ratio": 0.4,
     "vol_target": 0.15,
     "trend_ma": 220,
     "risk_off_threshold": -0.05,
+    "rebalance_freq": "monthly",
+    "extra_factor_weights": {
+        "ma20_slope": 0.03, "ma60_slope": 0.02,
+        "ma_score": 0.02, "vp_corr_20d": 0.03,
+    },
+}
+
+# Weekly parameters variant
+BEST_PARAMS_WEEKLY = {
+    "top_n_bull": 25, "top_n_bear": 12,
+    "mom_periods": (21, 63, 126, 252),
+    "mom_weights": (0.4, 0.3, 0.2, 0.1),
+    "score_weights_bull": (0.55, 0.30, 0.10),
+    "score_weights_bear": (0.33, 0.47, 0.12),
+    "stop_loss": -0.10,
+    "bear_cash_ratio": 0.4,
+    "vol_target": 0.15,
+    "trend_ma": 220,
+    "risk_off_threshold": -0.05,
+    "rebalance_freq": "weekly",
+    "extra_factor_weights": {
+        "ma20_slope": 0.03, "ma60_slope": 0.02,
+        "ma_score": 0.02, "vp_corr_20d": 0.03,
+    },
 }
 
 
 def main():
     print("=" * 70)
-    print("  ETF TRADING SYSTEM v2 — Trend-Filtered Momentum Rotation")
+    print("  ETF TRADING SYSTEM v2.1 — Trend-Filtered Momentum Rotation")
     print(f"  Universe: CSI 1000 Stocks + All ETFs (filtered)")
     print(f"  Data: Sina Finance + Baostock")
     print(f"  Period: {BACKTEST_START} -> {BACKTEST_END}")
+    print(f"  Factors: {len(FACTOR_KEYS)} factors (rank-normalized, look-ahead fixed)")
     print("=" * 70)
 
     # Step 1: Build Universe
@@ -96,7 +140,7 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "best"
 
     if mode == "best":
-        print(f"\n=== Running with Best Parameters ===")
+        print(f"\n=== Running v2.1 Baseline (Monthly, Look-ahead Fixed) ===")
         strategy = MomentumRotationStrategy(**BEST_PARAMS)
         result = run_backtest(price_matrix, volume_matrix, benchmark_prices,
                               strategy, stock_info=stock_info)
@@ -106,6 +150,28 @@ def main():
         metrics = compute_metrics(result)
         passed, details = check_targets(metrics)
         best_params = BEST_PARAMS
+    elif mode == "extra":
+        print(f"\n=== Running v2.1 with Extra Factors (Monthly) ===")
+        strategy = MomentumRotationStrategy(**BEST_PARAMS_EXTRA)
+        result = run_backtest(price_matrix, volume_matrix, benchmark_prices,
+                              strategy, stock_info=stock_info)
+        if result is None:
+            print("[FATAL] Backtest failed.")
+            return 1
+        metrics = compute_metrics(result)
+        passed, details = check_targets(metrics)
+        best_params = BEST_PARAMS_EXTRA
+    elif mode == "weekly":
+        print(f"\n=== Running v2.1 Weekly (Extra Factors + Look-ahead Fixed) ===")
+        strategy = MomentumRotationStrategy(**BEST_PARAMS_WEEKLY)
+        result = run_backtest(price_matrix, volume_matrix, benchmark_prices,
+                              strategy, stock_info=stock_info)
+        if result is None:
+            print("[FATAL] Backtest failed.")
+            return 1
+        metrics = compute_metrics(result)
+        passed, details = check_targets(metrics)
+        best_params = BEST_PARAMS_WEEKLY
     elif mode == "optimize":
         print(f"\n=== Running Parameter Optimization ===")
         result, metrics, best_params = optimize(
@@ -125,7 +191,7 @@ def main():
         else:
             passed, details = check_targets(metrics)
     else:  # single
-        print(f"\n=== Running Single Backtest (Default Strategy) ===")
+        print(f"\n=== Running Single Backtest (Default Monthly) ===")
         strategy = MomentumRotationStrategy()
         result = run_backtest(price_matrix, volume_matrix, benchmark_prices,
                               strategy, stock_info=stock_info)
@@ -160,7 +226,8 @@ def main():
     result["daily_stats"].to_csv(os.path.join(out_dir, "daily_stats.csv"), index=False)
     result["monthly_stats"].to_csv(os.path.join(out_dir, "monthly_stats.csv"), index=False)
     result["yearly_stats"].to_csv(os.path.join(out_dir, "yearly_stats.csv"), index=False)
-    pd.DataFrame([best_params]).to_csv(os.path.join(out_dir, "best_params.csv"), index=False)
+    if best_params:
+        pd.DataFrame([best_params]).to_csv(os.path.join(out_dir, "best_params.csv"), index=False)
 
     print(f"\n  All output saved to {out_dir}/")
     print(f"  Open {out_dir}/report.html for interactive dashboard")

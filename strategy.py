@@ -1,11 +1,19 @@
 """
-Strategy v2 — Trend-Filtered Momentum Rotation.
+Strategy v2.1 — Trend-Filtered Momentum Rotation (conservative upgrade).
 
-Classifies market as bull (index > MA) or bear (index < MA).
-Uses different parameters per regime for scoring and position sizing.
+v3 Hermes skill learnings applied:
+  - Look-ahead bias fixed: factor computation excludes today's close
+  - New optional factors: MA slope, MA alignment, vol-price correlation
+  - Cross-sectional rank normalization (same as old v2, verified correct)
+  - Configurable rebalance frequency
 """
 import numpy as np
 import pandas as pd
+
+FACTOR_KEYS = [
+    "momentum", "vol_score", "liq_score",
+    "ma20_slope", "ma60_slope", "ma_score", "vp_corr_20d",
+]
 
 
 class MomentumRotationStrategy:
@@ -25,6 +33,9 @@ class MomentumRotationStrategy:
         max_single_weight=0.10,
         trend_ma=220,
         bear_cash_ratio=0.4,
+        # v2.1 new params
+        rebalance_freq="monthly",
+        extra_factor_weights=None,
     ):
         self.top_n = top_n
         self.top_n_bull = top_n_bull
@@ -42,13 +53,23 @@ class MomentumRotationStrategy:
         self.max_single_weight = max_single_weight
         self.trend_ma = trend_ma
         self.bear_cash_ratio = bear_cash_ratio
+        self.rebalance_freq = rebalance_freq
         self._benchmark_prices = None
+
+        # Extra factor weights (new in v2.1, default 0 = pure v2 behavior)
+        if extra_factor_weights is not None:
+            self.extra_weights = extra_factor_weights
+        else:
+            self.extra_weights = {
+                "ma20_slope": 0.0, "ma60_slope": 0.0,
+                "ma_score": 0.0, "vp_corr_20d": 0.0,
+            }
 
     def set_benchmark(self, benchmark_prices):
         self._benchmark_prices = benchmark_prices
 
     def set_stock_info(self, stock_info):
-        pass  # compat
+        pass
 
     def detect_regime(self, current_date):
         if self._benchmark_prices is None:
@@ -63,17 +84,26 @@ class MomentumRotationStrategy:
         if len(prices) < self.vol_window + 21:
             return pd.DataFrame()
 
+        # Look-ahead fix: exclude today's close from factor computation
+        # We decide what to buy based on data up to T-1, then execute at T close
+        prices_factor = prices.iloc[:-1].copy()
+        if len(prices_factor) < max(self.mom_periods) + 21:
+            return pd.DataFrame()
+
         regime = self.detect_regime(current_date)
         sw = self.score_weights_bull if regime == "bull" else self.score_weights_bear
-        returns = prices.pct_change(fill_method=None).dropna(how="all")
+        returns = prices_factor.pct_change(fill_method=None).dropna(how="all")
 
         scores = []
-        for sym in prices.columns:
-            sym_prices = prices[sym].dropna()
+        for sym in prices_factor.columns:
+            sym_prices = prices_factor[sym].dropna()
             if len(sym_prices) < max(self.mom_periods) + 21:
                 continue
             sym_rets = returns[sym].dropna()
+            if len(sym_rets) < 20:
+                continue
 
+            # === Core momentum (unchanged from v2) ===
             mom_components = []
             for period in self.mom_periods:
                 if len(sym_prices) >= period:
@@ -82,6 +112,7 @@ class MomentumRotationStrategy:
                     mom_components.append(0.0)
             momentum = np.dot(self.mom_weights, mom_components)
 
+            # === Volatility score (unchanged) ===
             ann_vol = 0.0
             if len(sym_rets) >= self.vol_window:
                 vol_series = sym_rets.iloc[-self.vol_window:]
@@ -90,31 +121,84 @@ class MomentumRotationStrategy:
             else:
                 vol_score = 0.0
 
+            # === Liquidity score (unchanged) ===
             liq_score = 0.0
             if volume_matrix is not None and sym in volume_matrix.columns:
                 sv = volume_matrix[sym].dropna()
                 sv = sv[sv.index <= current_date]
+                # Exclude current date from volume data
+                sv = sv.iloc[:-1] if len(sv) > 1 and sv.index[-1] == current_date else sv
                 if len(sv) >= 20:
                     avg = sv.iloc[-20:].mean()
                     if avg > 0:
                         liq_score = np.log10(avg)
 
-            scores.append({"symbol": sym, "momentum": momentum,
-                           "vol_score": vol_score, "liq_score": liq_score,
-                           "price": sym_prices.iloc[-1], "ann_vol": ann_vol})
+            # === New factors (v2.1) ===
+            ma20 = sym_prices.rolling(20).mean()
+            ma60 = sym_prices.rolling(60).mean()
+            ma120 = sym_prices.rolling(120).mean()
+
+            ma20_slope = 0.0
+            ma60_slope = 0.0
+            if len(ma20.dropna()) >= 6:
+                ma20_slope = (ma20.iloc[-1] - ma20.iloc[-6]) / max(abs(ma20.iloc[-6]), 0.001)
+            if len(ma60.dropna()) >= 6:
+                ma60_slope = (ma60.iloc[-1] - ma60.iloc[-6]) / max(abs(ma60.iloc[-6]), 0.001)
+
+            ma_score_val = 1.5
+            if len(ma20.dropna()) > 0 and len(ma60.dropna()) > 0 and len(ma120.dropna()) > 0:
+                s = 0
+                if sym_prices.iloc[-1] > ma20.iloc[-1]: s += 1
+                if ma20.iloc[-1] > ma60.iloc[-1]: s += 1
+                if ma60.iloc[-1] > ma120.iloc[-1]: s += 1
+                ma_score_val = s
+
+            vp_corr = 0.0
+            if volume_matrix is not None and sym in volume_matrix.columns:
+                vol_all = volume_matrix[sym].dropna()
+                vol_all = vol_all[vol_all.index <= current_date]
+                vol_all = vol_all.iloc[:-1] if len(vol_all) > 1 else vol_all
+                vol_chg = vol_all.pct_change().dropna()
+                ci = sym_rets.index.intersection(vol_chg.index)
+                if len(ci) >= 20:
+                    vp_corr = sym_rets.loc[ci[-20:]].corr(vol_chg.loc[ci[-20:]])
+                    if pd.isna(vp_corr):
+                        vp_corr = 0.0
+
+            scores.append({
+                "symbol": sym,
+                "momentum": momentum, "vol_score": vol_score, "liq_score": liq_score,
+                "ma20_slope": ma20_slope, "ma60_slope": ma60_slope,
+                "ma_score": ma_score_val, "vp_corr_20d": vp_corr,
+                "price": sym_prices.iloc[-1], "ann_vol": ann_vol,
+            })
 
         if not scores:
             return pd.DataFrame()
 
         scores_df = pd.DataFrame(scores)
+
+        # Rank normalize core factors
         for col in ["momentum", "vol_score", "liq_score"]:
             s = scores_df[col]
-            scores_df[col + "_norm"] = s.rank(pct=True) if s.std() > 0 else 0.5
+            scores_df[col + "_norm"] = s.rank(pct=True) if s.std() > 1e-9 else 0.5
 
+        # Rank normalize extra factors (for optional use)
+        for col in ["ma20_slope", "ma60_slope", "ma_score", "vp_corr_20d"]:
+            s = scores_df[col]
+            scores_df[col + "_norm"] = s.rank(pct=True) if s.std() > 1e-9 else 0.5
+
+        # Composite score: core v2 weights + optional extra weights
         w_m, w_v, w_l = sw
         scores_df["composite"] = (w_m * scores_df["momentum_norm"] +
                                   w_v * scores_df["vol_score_norm"] +
                                   w_l * scores_df["liq_score_norm"])
+
+        for ek, ew in self.extra_weights.items():
+            nk = ek + "_norm"
+            if ew != 0.0 and nk in scores_df.columns:
+                scores_df["composite"] += ew * scores_df[nk]
+
         scores_df = scores_df.sort_values("composite", ascending=False)
         scores_df["rank"] = range(1, len(scores_df) + 1)
         return scores_df

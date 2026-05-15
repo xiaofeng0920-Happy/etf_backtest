@@ -1,13 +1,48 @@
 """
-Backtesting engine v2 — monthly rebalancing, daily tracking, stop-loss, risk mgmt.
+Backtesting engine v2.1 — configurable freq (monthly/weekly), look-ahead fixed.
 """
 import numpy as np
 import pandas as pd
 
 
+def _build_rebalance_dates(common_dates, freq, start_date=None):
+    if freq == "weekly":
+        # Every Monday (or next available trading day)
+        rebal_dates = []
+        seen_weeks = set()
+        for d in common_dates:
+            if start_date and d < start_date:
+                continue
+            wk = (d.year, d.isocalendar().week)
+            if wk not in seen_weeks:
+                rebal_dates.append(d)
+                seen_weeks.add(wk)
+        # Skip first 12 weeks for warmup
+        if len(rebal_dates) > 12:
+            rebal_dates = rebal_dates[12:]
+        return rebal_dates
+    elif freq == "monthly":
+        rebal_dates = []
+        seen_months = set()
+        for ms in pd.date_range(common_dates[0], common_dates[-1], freq="MS"):
+            me = ms + pd.offsets.MonthEnd(1)
+            mask = common_dates <= me
+            if mask.any():
+                rd = common_dates[mask][-1]
+                if (rd.year, rd.month) not in seen_months:
+                    rebal_dates.append(rd)
+                    seen_months.add((rd.year, rd.month))
+        if len(rebal_dates) > 12:
+            rebal_dates = rebal_dates[12:]
+        return rebal_dates
+    else:
+        raise ValueError(f"Unknown rebalance frequency: {freq}")
+
+
 def run_backtest(price_matrix, volume_matrix, benchmark_prices, strategy,
                  start_date=None, end_date=None, cost_stock=0.001, cost_etf=0.0005,
                  min_history_days=252, stock_info=None):
+    freq = getattr(strategy, "rebalance_freq", "monthly")
     common_dates = price_matrix.index
     if start_date:
         common_dates = common_dates[common_dates >= pd.Timestamp(start_date)]
@@ -17,18 +52,7 @@ def run_backtest(price_matrix, volume_matrix, benchmark_prices, strategy,
         print(f"[ERROR] Not enough data: {len(common_dates)} days")
         return None
 
-    rebal_dates = []
-    for ms in pd.date_range(common_dates[0], common_dates[-1], freq="MS"):
-        me = ms + pd.offsets.MonthEnd(1)
-        mask = common_dates <= me
-        if mask.any():
-            rd = common_dates[mask][-1]
-            if rd not in rebal_dates:
-                rebal_dates.append(rd)
-    if len(rebal_dates) > 12:
-        rebal_dates = rebal_dates[12:]
-    else:
-        rebal_dates = []
+    rebal_dates = _build_rebalance_dates(common_dates, freq, start_date)
     if not rebal_dates:
         print("[ERROR] No rebalancing dates available")
         return None
@@ -63,7 +87,7 @@ def run_backtest(price_matrix, volume_matrix, benchmark_prices, strategy,
         for sym in stopped:
             del holdings[sym]
 
-        # Monthly rebalance
+        # Rebalance
         if rebal_idx < len(rebal_dates) and date == rebal_dates[rebal_idx]:
             rebal_idx += 1
 
@@ -83,7 +107,7 @@ def run_backtest(price_matrix, volume_matrix, benchmark_prices, strategy,
                 port_rets = _portfolio_daily_returns(portfolio_values)
                 target_weights = strategy.apply_vol_target(target_weights, port_rets)
 
-                # Sell all
+                # Sell all old holdings
                 for sym, h in list(holdings.items()):
                     if sym in price_matrix.columns and date in price_matrix.index:
                         sp = price_matrix.loc[date, sym]
@@ -91,7 +115,7 @@ def run_backtest(price_matrix, volume_matrix, benchmark_prices, strategy,
                             cash += h["shares"] * sp * (1 - cost_stock)
                     del holdings[sym]
 
-                # Buy new
+                # Buy new holdings
                 equity_value = _compute_equity(holdings, price_matrix, date)
                 pv = cash + equity_value
 
